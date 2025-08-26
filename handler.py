@@ -27,8 +27,7 @@ HF_TOKEN_ENV   = os.getenv("HF_TOKEN")
 
 ALLOWED_WHISPER_ARGS = {
     "beam_size","patience","length_penalty","temperature",
-    "compression_ratio_threshold","log_prob_threshold","no_speech_threshold",
-    "condition_on_previous_text","initial_prompt","vad_filter","vad_parameters",
+    "compression_ratio_threshold","log_prob_threshold","no_speech_threshold","initial_prompt","vad_filter","vad_parameters",
     "prompt_reset_on_temperature","temperature_increment_on_fallback",
     "without_timestamps","word_timestamps","chunk_size"
 }
@@ -152,7 +151,6 @@ def handler(job):
     for k, v in whisper_over.items():
         if k in ALLOWED_WHISPER_ARGS:
             whisper_kwargs[k] = v
-    whisper_kwargs.setdefault("condition_on_previous_text", False)
     whisper_kwargs.setdefault("vad_filter", True)
 
     # 1) load audio
