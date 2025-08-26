@@ -1,6 +1,5 @@
 # /src/handler.py
-# WhisperX worker for RunPod Serverless (lazy imports, word-level align, optional diarization)
-
+# Pro-mode: faster-whisper (ASR with full decoder control) + whisperX alignment (word/char)
 import os, json, base64, tempfile, time, math
 import runpod
 import requests
@@ -8,40 +7,54 @@ import requests
 # -------- lazy heavy imports (ускоряет cold start) --------
 _torch = None
 _whisperx = None
+_FWClass = None  # faster_whisper.WhisperModel
+
 def _lazy_imports():
-    global _torch, _whisperx
+    global _torch, _whisperx, _FWClass
     if _torch is None:
         import torch as _t
         _torch = _t
     if _whisperx is None:
         import whisperx as _w
         _whisperx = _w
-    return _torch, _whisperx
+    if _FWClass is None:
+        from faster_whisper import WhisperModel as _FW
+        _FWClass = _FW
+    return _torch, _whisperx, _FWClass
 
 # -------- config / env --------
-FORCE_DEVICE   = os.getenv("FORCE_DEVICE", "auto")  # auto|cuda|cpu
-DEFAULT_MODEL  = os.getenv("MODEL_NAME", "large-v3")
-DEFAULT_BATCH  = int(os.getenv("BATCH_SIZE", "8"))
-DEFAULT_COMPUTE= os.getenv("COMPUTE_TYPE", "float16")
-HF_TOKEN_ENV   = os.getenv("HF_TOKEN")
+FORCE_DEVICE    = os.getenv("FORCE_DEVICE", "auto")   # auto|cuda|cpu
+DEFAULT_MODEL   = os.getenv("MODEL_NAME", "large-v3")
+DEFAULT_BATCH   = int(os.getenv("BATCH_SIZE", "8"))
+DEFAULT_COMPUTE = os.getenv("COMPUTE_TYPE", "float16")  # float16 on GPU, int8 on CPU
+HF_TOKEN_ENV    = os.getenv("HF_TOKEN")
+HF_HOME         = os.getenv("HF_HOME", "/root/.cache/huggingface")
+WHISPER_CACHE   = os.getenv("WHISPER_CACHE", "/root/.cache/whisper")
 
-ALLOWED_WHISPER_ARGS = {
-    "beam_size","patience","length_penalty","temperature",
-    "compression_ratio_threshold","log_prob_threshold","no_speech_threshold","initial_prompt","vad_filter","vad_parameters",
-    "prompt_reset_on_temperature","temperature_increment_on_fallback",
-    "without_timestamps","word_timestamps","chunk_size"
+# Разрешённые kwargs для faster-whisper .transcribe(...)
+ALLOWED_FW_ARGS = {
+    "beam_size","best_of","patience","length_penalty","temperature",
+    "compression_ratio_threshold","log_prob_threshold","no_speech_threshold",
+    "vad_filter","vad_parameters",
+    "condition_on_previous_text","initial_prompt","prefix",
+    "suppress_blank","suppress_tokens",
+    "without_timestamps","max_initial_timestamp","word_timestamps",
+    "prepend_punctuations","append_punctuations","clip_timestamps",
+    "hallucination_silence_threshold","hotwords",
+    "chunk_length"  # сек, длина чанка для транскрибации
+    # batch_size передаём отдельно (см. ниже)
 }
 
 # -------- caches --------
-_model = None
-_model_cfg = {}
+_fw_model = None
+_fw_cfg   = {}      # {'name','ctype','device'}
 _align_model = None
 _align_meta  = None
-_align_cfg   = {}
+_align_cfg   = {}   # {'lang','model_name'}
 
 # -------- helpers --------
 def _device():
-    t, _ = _lazy_imports()
+    t, _, _ = _lazy_imports()
     if FORCE_DEVICE == "cuda" and t.cuda.is_available():
         return "cuda"
     if FORCE_DEVICE == "cpu":
@@ -50,7 +63,7 @@ def _device():
 
 def _normalize_compute_type(device, requested):
     if device == "cpu":
-        return "int8"  # безопасный дефолт на CPU
+        return "int8"  # безопасный дефолт для CPU
     return requested or "float16"
 
 def _download_to_tmp(p):
@@ -75,25 +88,34 @@ def _download_to_tmp(p):
         return p["audio_path"]
     raise ValueError("Provide 'audio_url' or 'audio_b64' or 'audio_path'.")
 
-def _ensure_model(model_name, compute_type, batch_size):
-    global _model, _model_cfg
-    _, wx = _lazy_imports()
+def _ensure_fw_model(model_name, compute_type):
+    """Init faster-whisper WhisperModel once per worker with desired compute_type/device."""
+    global _fw_model, _fw_cfg
+    _, _, FW = _lazy_imports()
     dev = _device()
     ctype = _normalize_compute_type(dev, compute_type)
-    if _model is None or _model_cfg.get("name") != model_name or _model_cfg.get("ctype") != ctype:
-        _model = wx.load_model(model_name, dev, compute_type=ctype)
-        _model_cfg = {"name": model_name, "ctype": ctype}
-    return _model
+    changed = (
+        _fw_model is None or
+        _fw_cfg.get("name") != model_name or
+        _fw_cfg.get("ctype") != ctype or
+        _fw_cfg.get("device") != dev
+    )
+    if changed:
+        # download_root=WHISPER_CACHE — кэш весов в контейнере
+        _fw_model = FW(model_name, device=dev, compute_type=ctype,
+                       download_root=WHISPER_CACHE)
+        _fw_cfg = {"name": model_name, "ctype": ctype, "device": dev}
+    return _fw_model
 
 def _ensure_aligner(lang_code, model_name=None):
+    """Init wav2vec2 aligner for given language (RU→ jonatasgrosman/...russian)."""
     global _align_model, _align_meta, _align_cfg
-    _, wx = _lazy_imports()
+    _, wx, _ = _lazy_imports()
     dev = _device()
     if (
-        _align_model is None
-        or _align_meta is None
-        or _align_cfg.get("lang") != lang_code
-        or (model_name and _align_cfg.get("model_name") != model_name)
+        _align_model is None or _align_meta is None or
+        _align_cfg.get("lang") != lang_code or
+        (model_name and _align_cfg.get("model_name") != model_name)
     ):
         _align_model, _align_meta = wx.load_align_model(
             language_code=lang_code, device=dev, model_name=model_name
@@ -111,8 +133,7 @@ def _make_srt(segments):
     for i, seg in enumerate(segments, 1):
         lines.append(str(i))
         lines.append(f"{_ts_srt(seg.get('start', 0))} --> {_ts_srt(seg.get('end', 0))}")
-        lines.append((seg.get("text") or "").strip())
-        lines.append("")
+        lines.append((seg.get("text") or "").strip()); lines.append("")
     return "\n".join(lines)
 
 def _make_vtt(segments):
@@ -135,50 +156,63 @@ def handler(job):
     batch_size   = int(p.get("batch_size", DEFAULT_BATCH))
     compute_type = p.get("compute_type", DEFAULT_COMPUTE)
 
-    language   = p.get("language")          # "ru" и т.п.
-    align      = bool(p.get("align", True))
-    char_align = bool(p.get("char_align", False))
-    diarize    = bool(p.get("diarize", False))
-    hf_token   = p.get("hf_token") or HF_TOKEN_ENV
+    language     = p.get("language")           # "ru" и т.п.
+    align        = bool(p.get("align", True))
+    char_align   = bool(p.get("char_align", False))
+    diarize      = bool(p.get("diarize", False))
+    hf_token     = p.get("hf_token") or HF_TOKEN_ENV
 
-    align_model_name = p.get("align_model")  # явный HF aligner
-    return_raw = bool(p.get("return_raw", True))
-    return_srt = bool(p.get("return_srt", True))
-    return_vtt = bool(p.get("return_vtt", False))
+    align_model_name = p.get("align_model")    # явный HF aligner
+    return_raw  = bool(p.get("return_raw", True))
+    return_srt  = bool(p.get("return_srt", True))
+    return_vtt  = bool(p.get("return_vtt", False))
 
-    whisper_over   = p.get("whisper", {}) or {}
-    whisper_kwargs = {"batch_size": batch_size}
-    for k, v in whisper_over.items():
-        if k in ALLOWED_WHISPER_ARGS:
-            whisper_kwargs[k] = v
-    whisper_kwargs.setdefault("vad_filter", True)
+    # faster-whisper kwargs (полный контроль декодера)
+    fw_over = p.get("whisper", {}) or {}
+    fw_kwargs = {"batch_size": batch_size}
+    for k, v in fw_over.items():
+        if k in ALLOWED_FW_ARGS:
+            fw_kwargs[k] = v
 
-    # 1) load audio
-    _, wx = _lazy_imports()
+    # 1) Скачиваем/подготавливаем аудио (для faster-whisper можно путь к файлу)
     audio_path = _download_to_tmp(p)
-    audio = wx.load_audio(audio_path)
 
-    # 2) ASR
-    asr = _ensure_model(model_name, compute_type, batch_size)
-    result_asr = asr.transcribe(audio, language=language, **whisper_kwargs)
+    # 2) ASR: faster-whisper напрямую
+    fw = _ensure_fw_model(model_name, compute_type)
+    # В faster-whisper допустимо передать путь к файлу (он сам вычитает)
+    segments_iter, info = fw.transcribe(audio_path, language=language, **fw_kwargs)
 
-    segments_raw  = result_asr.get("segments", [])
-    detected_lang = result_asr.get("language") or language
+    # 2.1) нормализуем сегменты в список под whisperX
+    segments_raw = []
+    for s in segments_iter:
+        segments_raw.append({
+            "id": s.id,
+            "start": float(s.start or 0.0),
+            "end": float(s.end or 0.0),
+            "text": (s.text or "").strip()
+        })
 
-    # 3) Alignment (wav2vec2)
+    detected_lang = info.language or language
+
+    # 3) Alignment (wav2vec2) → словесные/символьные таймкоды
     segments_aligned = segments_raw
     diarize_segments = None
+
     if align and segments_raw:
+        # whisperX ждёт float32 16k; используем их загрузчик
+        _, wx, _ = _lazy_imports()
+        audio = wx.load_audio(audio_path)
         lang = (language or detected_lang or "ru")
         align_model, meta = _ensure_aligner(lang, model_name=align_model_name)
         aligned = wx.align(segments_raw, align_model, meta, audio, _device(),
                            return_char_alignments=char_align)
         segments_aligned = aligned.get("segments", aligned)
 
-    # 4) (Optional) diarization
+    # 4) (Optional) diarization (pyannote) → speaker per word
     if diarize:
         if not hf_token:
             raise ValueError("Diarization requested but no HF token provided (env HF_TOKEN or input.hf_token)")
+        _, wx, _ = _lazy_imports()
         diar = wx.diarize.DiarizationPipeline(use_auth_token=hf_token, device=_device())
         diarize_segments = diar(audio,
                                 min_speakers=p.get("min_speakers"),
@@ -189,7 +223,7 @@ def handler(job):
     out = {
         "device": _device(),
         "model": model_name,
-        "compute_type": _model_cfg.get("ctype"),
+        "compute_type": _fw_cfg.get("ctype"),
         "language": detected_lang,
         "timing": {"total_sec": round(time.time() - t0, 3)}
     }
