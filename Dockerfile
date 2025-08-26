@@ -40,6 +40,7 @@ RUN pip install whisperx==3.4.2 runpod==1.7.13 requests srt numpy
 
 WORKDIR /src
 COPY handler.py /src/handler.py
+RUN python3 -m py_compile /src/handler.py
 
 
 CMD ["python3", "-u", "handler.py"]
