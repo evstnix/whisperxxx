@@ -145,6 +145,17 @@ def _make_vtt(segments):
         lines.append((seg.get("text") or "").strip()); lines.append("")
     return "\n".join(lines)
 
+def _log_versions_once():
+    if os.environ.get("VER_LOGGED"): 
+        return
+    t, _, _ = _lazy_imports()
+    try:
+        import ctranslate2
+        print(f"[versions] torch={t.__version__} cuda={t.version.cuda} cudnn={t.backends.cudnn.version()} ct2={ctranslate2.__version__}")
+    except Exception as e:
+        print(f"[versions] torch=? err={e}")
+    os.environ["VER_LOGGED"] = "1"
+    
 # -------- main handler --------
 def handler(job):
     t0 = time.time()
