@@ -1,5 +1,5 @@
 # /src/handler.py
-# Pro-mode: faster-whisper (ASR with full decoder control) + whisperX alignment (word/char)
+# Pro-mode: faster-whisper (ASR with full decoder control) + WhisperX alignment (word/char)
 import os, json, base64, tempfile, time, math
 import runpod
 import requests
@@ -25,8 +25,8 @@ def _lazy_imports():
 # -------- config / env --------
 FORCE_DEVICE    = os.getenv("FORCE_DEVICE", "auto")   # auto|cuda|cpu
 DEFAULT_MODEL   = os.getenv("MODEL_NAME", "large-v3")
-DEFAULT_BATCH   = int(os.getenv("BATCH_SIZE", "8"))   # используем, если захочешь в будущем, но в FW .transcribe не передаем
-DEFAULT_COMPUTE = os.getenv("COMPUTE_TYPE", "float16")  # float16 on GPU, int8 on CPU
+DEFAULT_BATCH   = int(os.getenv("BATCH_SIZE", "8"))   # (в FW .transcribe не используем)
+DEFAULT_COMPUTE = os.getenv("COMPUTE_TYPE", "float16")  # float16 на GPU, int8 на CPU
 HF_TOKEN_ENV    = os.getenv("HF_TOKEN")
 HF_HOME         = os.getenv("HF_HOME", "/root/.cache/huggingface")
 WHISPER_CACHE   = os.getenv("WHISPER_CACHE", "/root/.cache/whisper")
@@ -146,7 +146,7 @@ def _make_vtt(segments):
     return "\n".join(lines)
 
 def _log_versions_once():
-    if os.environ.get("VER_LOGGED"): 
+    if os.environ.get("VER_LOGGED"):
         return
     t, _, _ = _lazy_imports()
     try:
@@ -155,16 +155,26 @@ def _log_versions_once():
     except Exception as e:
         print(f"[versions] torch=? err={e}")
     os.environ["VER_LOGGED"] = "1"
-    
+
+def _preload_once():
+    if os.environ.get("PRELOADED"):
+        return
+    _ensure_fw_model(os.getenv("MODEL_NAME", "large-v3"), os.getenv("COMPUTE_TYPE", "float16"))
+    for lang in (os.getenv("PRELOAD_LANGS","ru").split()):
+        _ensure_aligner(lang)
+    os.environ["PRELOADED"] = "1"
+
 # -------- main handler --------
 def handler(job):
+    _log_versions_once()
+    if os.getenv("PRELOAD","1") == "1":
+        _preload_once()
+
     t0 = time.time()
     p = job.get("input", {})
 
     model_name   = p.get("model", DEFAULT_MODEL)
-    # batch_size оставляем для будущих целей, но в FW .transcribe НЕ передаем:
-    # FW управляет разбиением через chunk_length и внутренние воркеры
-    batch_size   = int(p.get("batch_size", DEFAULT_BATCH))
+    batch_size   = int(p.get("batch_size", DEFAULT_BATCH))  # (не используется FW, но оставили для совместимости API)
     compute_type = p.get("compute_type", DEFAULT_COMPUTE)
 
     language     = p.get("language")           # "ru" и т.п.
@@ -204,15 +214,20 @@ def handler(job):
 
     detected_lang = info.language or language
 
+    # Если потребуется align или diarize — загрузим аудио через whisperX (16k, float32)
+    audio_wx = None
+    wx = None
+    if (align and segments_raw) or diarize:
+        _, wx, _ = _lazy_imports()
+        audio_wx = wx.load_audio(audio_path)
+
     # 3) Alignment (wav2vec2)
     segments_aligned = segments_raw
     diarize_segments = None
     if align and segments_raw:
-        _, wx, _ = _lazy_imports()
-        audio = wx.load_audio(audio_path)
         lang = (language or detected_lang or "ru")
         align_model, meta = _ensure_aligner(lang, model_name=align_model_name)
-        aligned = wx.align(segments_raw, align_model, meta, audio, _device(),
+        aligned = wx.align(segments_raw, align_model, meta, audio_wx, _device(),
                            return_char_alignments=char_align)
         segments_aligned = aligned.get("segments", aligned)
 
@@ -220,9 +235,8 @@ def handler(job):
     if diarize:
         if not hf_token:
             raise ValueError("Diarization requested but no HF token provided (env HF_TOKEN or input.hf_token)")
-        _, wx, _ = _lazy_imports()
         diar = wx.diarize.DiarizationPipeline(use_auth_token=hf_token, device=_device())
-        diarize_segments = diar(audio,
+        diarize_segments = diar(audio_wx,
                                 min_speakers=p.get("min_speakers"),
                                 max_speakers=p.get("max_speakers"))
         segments_aligned = wx.assign_word_speakers(diarize_segments, {"segments": segments_aligned})["segments"]
